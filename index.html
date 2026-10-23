@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#10251c">
+<title>Bike Journey Recorder</title>
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:Arial,sans-serif;background:#f1f5f3;color:#17251d}
+header{background:#10251c;color:white;padding:18px}
+header h1{font-size:22px;margin:0 0 6px}
+header p{margin:0;color:#c6d9ce;font-size:13px}
+main{max-width:800px;margin:auto;padding:14px}
+.stats{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+.stat{background:white;padding:15px;border-radius:14px;box-shadow:0 2px 7px #0001}
+.stat span{display:block;font-size:12px;color:#637168}
+.stat strong{display:block;font-size:24px;margin-top:7px}
+#map{height:43vh;min-height:280px;border-radius:14px;margin:14px 0;background:#dfe8e2;z-index:1;}
+.buttons{display:grid;grid-template-columns:repeat(2,1fr);gap:9px}
+button{padding:14px 8px;border:0;border-radius:10px;font-size:15px;
+font-weight:bold;cursor:pointer}
+.start{background:#147d4b;color:white}
+.pause{background:#ffcf66;color:#302300}
+.stop{background:#d83e3e;color:white}
+.save{background:#174e9a;color:white}
+.secondary{background:#e0e9e3;color:#183728}
+button:disabled{opacity:.4;cursor:not-allowed}
+#status{padding:12px;background:white;border-radius:10px;margin:12px 0;
+font-size:14px;line-height:1.5}
+.note{font-size:12px;color:#637168;line-height:1.6;margin-top:14px}
+footer{text-align:center;font-size:12px;padding:15px;color:#65746b}
+
+/* Custom styles for Direction Guide Marker */
+.custom-bike-icon {
+  background: transparent;
+  border: none;
+}
+.bike-marker {
+  width: 28px; 
+  height: 28px;
+  background: #147d4b;
+  border: 2.5px solid white;
+  border-radius: 50%;
+  box-shadow: 0 0 6px rgba(0,0,0,0.4);
+  display: flex; 
+  align-items: center; 
+  justify-content: center;
+}
+.bike-arrow {
+  width: 0; 
+  height: 0;
+  border-left: 6px solid transparent;
+  border-right: 6px solid transparent;
+  border-bottom: 12px solid white;
+  transform-origin: center 60%;
+  transition: transform 0.3s ease;
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>🏍️ Bike Journey Recorder</h1>
+  <p>Record your ride • Track distance • Save your route</p>
+</header>
+
+<main>
+  <div class="stats">
+    <div class="stat"><span>Distance</span><strong id="distance">0.00 km</strong></div>
+    <div class="stat"><span>Duration</span><strong id="duration">00:00:00</strong></div>
+    <div class="stat"><span>Current speed</span><strong id="speed">0 km/h</strong></div>
+    <div class="stat"><span>Average speed</span><strong id="average">0 km/h</strong></div>
+  </div>
+
+  <div id="map"></div>
+
+  <div class="buttons">
+    <button class="start" id="start">▶ Start ride</button>
+    <button class="pause" id="pause" disabled>Ⅱ Pause</button>
+    <button class="stop" id="stop" disabled>■ Stop ride</button>
+    <button class="save" id="save" disabled>⬇ Export KML</button>
+    <button class="secondary" id="locate">◎ Find my location</button>
+    <button class="secondary" id="reset">↻ New journey</button>
+  </div>
+
+  <div id="status" role="status" aria-live="polite">
+    Ready. Allow location access to start recording.
+  </div>
+
+  <p class="note">
+    Keep this page open during your ride. GPS accuracy varies.
+    Use the layers icon on the top right of the map to switch to Satellite View.
+    The directional arrow shows your heading.
+  </p>
+</main>
+
+<footer>
+  Map data © OpenStreetMap & Esri contributors
+</footer>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+
+const hasMap = typeof L !== 'undefined';
+let map = null;
+
+if (hasMap) {
+  // Street layer
+  const osmLayer = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap'
+  });
+  
+  // Satellite view layer (Esri World Imagery)
+  const satelliteLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+    maxZoom: 19,
+    attribution: '&copy; Esri'
+  });
+
+  map = L.map('map', {
+    center: [20.5937, 78.9629],
+    zoom: 5,
+    layers: [osmLayer] // Default map view
+  });
+
+  // Add layer control switch (Top right of map)
+  L.control.layers({
+    "Street Map": osmLayer,
+    "Satellite": satelliteLayer
+  }).addTo(map);
+}
+
+let watchId = null;
+let marker = null;
+let trackLine = null;
+let points = [];
+let segment = 0;
+let totalMeters = 0;
+let currentSpeed = 0;
+let elapsedBefore = 0;
+let segmentStarted = null;
+let timer = null;
+let state = 'idle';
+let lastAccepted = null;
+let wakeLock = null;
+let currentHeading = 0; // Store the direction
+
+function status(message) {
+  $('status').textContent = message;
+}
+
+function elapsed() {
+  return elapsedBefore + (segmentStarted ? Date.now() - segmentStarted : 0);
+}
+
+function formatTime(ms) {
+  let s = Math.floor(ms / 1000);
+  const h = Math.floor(s / 3600);
+  s %= 3600;
+  const m = Math.floor(s / 60);
+  s %= 60;
+  return [h,m,s].map(n => String(n).padStart(2,'0')).join(':');
+}
+
+function updateStats() {
+  $('distance').textContent = (totalMeters / 1000).toFixed(2) + ' km';
+  $('duration').textContent = formatTime(elapsed());
+  $('speed').textContent = currentSpeed.toFixed(1) + ' km/h';
+
+  const hours = elapsed() / 3600000;
+  $('average').textContent = (hours > 0 ? totalMeters / 1000 / hours : 0).toFixed(1) + ' km/h';
+}
+
+function distanceBetween(a, b) {
+  const rad = x => x * Math.PI / 180;
+  const dLat = rad(b.lat - a.lat);
+  const dLon = rad(b.lng - a.lng);
+  const lat1 = rad(a.lat);
+  const lat2 = rad(b.lat);
+  const h = Math.sin(dLat/2)**2 + Math.cos(lat1)*Math.cos(lat2)*Math.sin(dLon/2)**2;
+  return 6371000 * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1-h));
+}
+
+// Calculate direction (bearing) between two coordinates if device has no built-in compass
+function calculateHeading(a, b) {
+  const rad = Math.PI / 180;
+  const lat1 = a.lat * rad;
+  const lat2 = b.lat * rad;
+  const dLon = (b.lng - a.lng) * rad;
+  const y = Math.sin(dLon) * Math.cos(lat2);
+  const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon);
+  const brng = Math.atan2(y, x) * 180 / Math.PI;
+  return (brng + 360) % 360;
+}
+
+function getSegments() {
+  const groups = [];
+  points.forEach(p => {
+    if (!groups[p.seg]) groups[p.seg] = [];
+    groups[p.seg].push(p);
+  });
+  return groups.filter(g => g && g.length);
+}
+
+// Returns the rotating Direction Guide icon
+function getBikeIcon(heading) {
+  return L.divIcon({
+    className: 'custom-bike-icon',
+    html: `<div class="bike-marker">
+             <div class="bike-arrow" style="transform: rotate(${Math.round(heading)}deg);"></div>
+           </div>`,
+    iconSize: [28, 28],
+    iconAnchor: [14, 14]
+  });
+}
+
+function drawPoint(lat, lng, heading) {
+  if (!hasMap) return;
+
+  if (!marker) {
+    marker = L.marker([lat, lng], { icon: getBikeIcon(heading) }).addTo(map).bindPopup('Your bike location');
+  } else {
+    marker.setLatLng([lat, lng]);
+    marker.setIcon(getBikeIcon(heading)); // Update rotation
+  }
+
+  if (!trackLine) {
+    trackLine = L.polyline([], {color:'#07834d', weight:5}).addTo(map);
+  }
+
+  trackLine.setLatLngs(
+    getSegments().map(g => g.map(p => [p.lat, p.lng]))
+  );
+}
+
+async function lockScreen() {
+  try {
+    if ('wakeLock' in navigator && !wakeLock) {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => { wakeLock = null; });
+    }
+  } catch (e) {}
+}
+
+function unlockScreen() {
+  if (wakeLock) {
+    wakeLock.release().catch(() => {});
+    wakeLock = null;
+  }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && state === 'recording') {
+    lockScreen();
+  }
+});
+
+function onPosition(position) {
+  if (state !== 'recording') return;
+
+  const c = position.coords;
+
+  if (c.accuracy > 50) {
+    status('GPS accuracy is weak (' + Math.round(c.accuracy) + ' m). Waiting for a better reading.');
+    return;
+  }
+
+  const p = {
+    lat:c.latitude,
+    lng:c.longitude,
+    time:new Date(position.timestamp || Date.now()),
+    accuracy:c.accuracy,
+    speed:(c.speed != null && c.speed >= 0) ? c.speed : null,
+    seg:segment
+  };
+
+  // Determine direction / heading
+  if (c.heading !== null && !isNaN(c.heading)) {
+    currentHeading = c.heading; 
+  } else if (lastAccepted) {
+    currentHeading = calculateHeading(lastAccepted, p); // Calculate from movement
+  }
+
+  if (lastAccepted) {
+    const gap = (p.time - lastAccepted.time) / 1000;
+    const d = distanceBetween(lastAccepted, p);
+
+    if (gap > 0 && d / gap > 60) {
+      status('An unusual GPS jump was ignored. Waiting for the next reading.');
+      return;
+    }
+
+    if (d < 3) {
+      currentSpeed = p.speed == null ? 0 : p.speed * 3.6;
+      updateStats();
+      return;
+    }
+
+    totalMeters += d;
+    if (p.speed == null) {
+      currentSpeed = gap > 0 ? (d / gap) * 3.6 : 0;
+    } else {
+      currentSpeed = p.speed * 3.6;
+    }
+  } else {
+    currentSpeed = p.speed == null ? 0 : p.speed * 3.6;
+  }
+
+  points.push(p);
+  lastAccepted = p;
+
+  drawPoint(p.lat, p.lng, currentHeading);
+  if (hasMap) map.panTo([p.lat, p.lng]);
+  updateStats();
+  $('save').disabled = points.length < 2;
+
+  status('Recording GPS points: ' + points.length + '. GPS accuracy: ' + Math.round(c.accuracy) + ' m.');
+}
+
+function onError(error) {
+  const messages = {
+    1:'Location permission denied. Allow location access in browser settings.',
+    2:'GPS location unavailable. Check your phone location setting.',
+    3:'GPS request timed out. Wait for a better signal.'
+  };
+  status(messages[error.code] || 'Unable to read GPS location.');
+}
+
+function startGPS() {
+  if (state === 'recording') return;
+
+  if (!navigator.geolocation) {
+    status('This browser does not support GPS location.');
+    return;
+  }
+
+  if (!window.isSecureContext) {
+    status('GPS needs HTTPS. Open this website using its secure https:// address.');
+    return;
+  }
+
+  state = 'recording';
+  segment += 1;
+  lastAccepted = null;
+  segmentStarted = Date.now();
+
+  $('start').disabled = true;
+  $('pause').disabled = false;
+  $('pause').textContent = 'Ⅱ Pause';
+  $('stop').disabled = false;
+  $('save').disabled = true;
+
+  if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+  watchId = navigator.geolocation.watchPosition(
+    onPosition, onError,
+    {enableHighAccuracy:true, maximumAge:1000, timeout:20000}
+  );
+
+  clearInterval(timer);
+  timer = setInterval(updateStats, 1000);
+  lockScreen();
+  status('Requesting GPS signal. Allow location access when prompted.');
+}
+
+function pauseGPS() {
+  if (state !== 'recording') return;
+
+  elapsedBefore += Date.now() - segmentStarted;
+  segmentStarted = null;
+
+  if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+  watchId = null;
+  clearInterval(timer);
+  timer = null;
+  unlockScreen();
+  state = 'paused';
+  currentSpeed = 0;
+
+  $('start').disabled = false;
+  $('start').textContent = '▶ Resume ride';
+  $('pause').disabled = true;
+  $('stop').disabled = false;
+  $('save').disabled = points.length < 2;
+  status('Ride paused. Resume when ready.');
+  updateStats();
+}
+
+function stopGPS() {
+  if (state !== 'recording' && state !== 'paused') return;
+
+  if (state === 'recording') {
+    elapsedBefore += Date.now() - segmentStarted;
+  }
+
+  if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+  watchId = null;
+  segmentStarted = null;
+  clearInterval(timer);
+  timer = null;
+  unlockScreen();
+  currentSpeed = 0;
+  state = 'stopped';
+
+  $('start').disabled = true;
+  $('pause').disabled = true;
+  $('stop').disabled = true;
+  $('save').disabled = points.length < 2;
+  updateStats();
+
+  status(points.length >= 2
+    ? 'Ride stopped. Tap Export KML to save the route.'
+    : 'Ride stopped. Not enough GPS points for a route yet.');
+}
+
+function resetRide() {
+  if (state === 'recording') {
+    status('Pause or stop your current ride before starting a new journey.');
+    return;
+  }
+
+  if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+  clearInterval(timer);
+  unlockScreen();
+
+  watchId = null;
+  timer = null;
+  points = [];
+  segment = 0;
+  totalMeters = 0;
+  currentSpeed = 0;
+  elapsedBefore = 0;
+  segmentStarted = null;
+  lastAccepted = null;
+  state = 'idle';
+
+  if (hasMap) {
+    if (marker) map.removeLayer(marker);
+    if (trackLine) map.removeLayer(trackLine);
+  }
+  marker = null;
+  trackLine = null;
+
+  $('start').disabled = false;
+  $('start').textContent = '▶ Start ride';
+  $('pause').disabled = true;
+  $('pause').textContent = 'Ⅱ Pause';
+  $('stop').disabled = true;
+  $('save').disabled = true;
+
+  updateStats();
+  status('Ready for a new journey.');
+}
+
+/* ---------- KML export ---------- */
+const xmlEsc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+const coord = p => p.lng.toFixed(6) + ',' + p.lat.toFixed(6) + ',0';
+
+function buildKML() {
+  const first = points[0];
+  const last = points[points.length - 1];
+  const hours = elapsed() / 3600000;
+  const avg = hours > 0 ? totalMeters / 1000 / hours : 0;
+
+  const title = 'Bike Journey ' + first.time.toISOString().slice(0,10);
+  const summary =
+    'Distance: ' + (totalMeters / 1000).toFixed(2) + ' km\n' +
+    'Duration: ' + formatTime(elapsed()) + '\n' +
+    'Average speed: ' + avg.toFixed(1) + ' km/h';
+
+  const lines = getSegments()
+    .filter(g => g.length >= 2)
+    .map(g => '      <LineString><tessellate>1</tessellate><coordinates>' +
+      g.map(coord).join(' ') + '</coordinates></LineString>')
+    .join('\n');
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+<Document>
+  <name>${xmlEsc(title)}</name>
+  <description>${xmlEsc(summary)}</description>
+  <Style id="route"><LineStyle><color>ff4d8307</color><width>5</width></LineStyle></Style>
+  <Placemark>
+    <name>Route</name>
+    <description>${xmlEsc(summary)}</description>
+    <styleUrl>#route</styleUrl>
+    <MultiGeometry>
+${lines}
+    </MultiGeometry>
+  </Placemark>
+  <Placemark>
+    <name>Start</name>
+    <TimeStamp><when>${first.time.toISOString()}</when></TimeStamp>
+    <Point><coordinates>${coord(first)}</coordinates></Point>
+  </Placemark>
+  <Placemark>
+    <name>End</name>
+    <TimeStamp><when>${last.time.toISOString()}</when></TimeStamp>
+    <Point><coordinates>${coord(last)}</coordinates></Point>
+  </Placemark>
+</Document>
+</kml>`;
+}
+
+function exportKML() {
+  const usable = getSegments().some(g => g.length >= 2);
+  if (!usable) {
+    status('Record at least two GPS points in one stretch before exporting.');
+    return;
+  }
+
+  const d = new Date();
+  const pad = n => String(n).padStart(2,'0');
+  const name = 'bike-journey-' + d.getFullYear() + '-' + pad(d.getMonth()+1) +
+    '-' + pad(d.getDate()) + '-' + pad(d.getHours()) + pad(d.getMinutes()) + '.kml';
+
+  const blob = new Blob([buildKML()], {type:'application/vnd.google-earth.kml+xml'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+  status('KML saved as ' + name + '. Check your Downloads folder.');
+}
+
+function locateMe() {
+  if (!navigator.geolocation) {
+    status('GPS is not available in this browser.');
+    return;
+  }
+
+  if (!window.isSecureContext) {
+    status('Open this website over HTTPS to use GPS.');
+    return;
+  }
+
+  status('Finding your location...');
+
+  navigator.geolocation.getCurrentPosition(pos => {
+    const lat = pos.coords.latitude;
+    const lng = pos.coords.longitude;
+    const heading = pos.coords.heading || 0;
+
+    if (hasMap) {
+      map.setView([lat,lng], 17);
+      if (!marker) marker = L.marker([lat,lng], {icon: getBikeIcon(heading)}).addTo(map);
+      else {
+        marker.setLatLng([lat,lng]);
+        marker.setIcon(getBikeIcon(heading));
+      }
+    }
+
+    status('Location found. Accuracy: ' + Math.round(pos.coords.accuracy) + ' metres.');
+  }, onError, {enableHighAccuracy:true, timeout:20000});
+}
+
+$('start').addEventListener('click', startGPS);
+$('pause').addEventListener('click', pauseGPS);
+$('stop').addEventListener('click', stopGPS);
+$('save').addEventListener('click', exportKML);
+$('locate').addEventListener('click', locateMe);
+$('reset').addEventListener('click', resetRide);
+
+updateStats();
+if (!hasMap) {
+  status('Map could not load (check internet). Recording and KML export still work.');
+}
+</script>
+</body>
+</html>
+<ALOASK-SEPARATE-EDITORS><ALOASK-SEPARATE-EDITORS>
